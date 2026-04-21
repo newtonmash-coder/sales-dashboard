@@ -1,19 +1,26 @@
 # ==========================================================
 # data_engine.py
-# FIXED VERSION — works with CSV sales and target files
+# FIXED — uses recursive folder search so files inside
+#          subfolders (e.g. "Spread", "Targets_Spreads")
+#          are found automatically
 # ==========================================================
 
 import pandas as pd
 import re
 from datetime import datetime
 
+import streamlit as st
+
 from drive_loader import (
-    list_files_in_folder,
+    list_all_files_recursive,
     read_drive_file
 )
 
 # ----------------------------------------------------------
-# GOOGLE DRIVE FOLDER ID
+# ROOT GOOGLE DRIVE FOLDER ID
+# This is the TOP-LEVEL folder that contains both the
+# "Spread" subfolder (sales) and "Targets_Spreads" subfolder
+# Set this to the ID of "Rawdata 2024" folder
 # ----------------------------------------------------------
 FOLDER_ID = "1tX9kPXQK3WQvQVAIF0YambVHJyh34qeL"
 
@@ -38,7 +45,8 @@ def clean_columns(df):
 
 # ----------------------------------------------------------
 # EXTRACT MONTH & YEAR FROM FILE NAME
-# e.g. "1 Sales 2024.csv" → month=1, year=2024
+# "1 sales 2024.csv"    → month=1,  year=2024
+# "1 Targets 2024.csv"  → month=1,  year=2024
 # ----------------------------------------------------------
 def extract_month_year(filename):
     m = re.match(r"(\d+).*?(\d{4})", filename)
@@ -49,26 +57,54 @@ def extract_month_year(filename):
 
 # ----------------------------------------------------------
 # IS CURRENT MONTH FILE?
-# The file whose month/year matches today is "live"
 # ----------------------------------------------------------
 def is_current_month(month, year):
+    if month is None or year is None:
+        return False
     now = datetime.now()
     return month == now.month and year == now.year
 
 
 # ----------------------------------------------------------
+# CACHED FILE LOADERS
+# Old months / targets → cache 24 hours (never change)
+# Current month sales  → cache 5 minutes (daily updates)
+# ----------------------------------------------------------
+@st.cache_data(ttl=86400, show_spinner=False)
+def _load_file_cached(file_id):
+    return read_drive_file(file_id)
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _load_file_live(file_id):
+    return read_drive_file(file_id)
+
+
+# ----------------------------------------------------------
 # LOAD ALL SALES FILES
-# Old months → cached 24 hrs | Current month → cached 5 min
+# Searches all subfolders recursively — finds files even if
+# they are inside a subfolder like "Spread"
 # ----------------------------------------------------------
 def load_sales_data():
-    import streamlit as st
+    # Get ALL files across all subfolders
+    all_files = list_all_files_recursive(FOLDER_ID)
 
-    files = list_files_in_folder(FOLDER_ID)
-    sales_files = [f for f in files if "sales" in f["name"].lower()]
+    # Filter: files whose name contains "sales" (case-insensitive)
+    sales_files = [
+        f for f in all_files
+        if "sales" in f["name"].lower()
+    ]
 
     if not sales_files:
-        st.error("No sales files found in the Google Drive folder.")
+        st.error(
+            "No sales files found. Make sure your files are named like "
+            "'1 sales 2024.csv' and are in the correct Google Drive folder."
+        )
         return pd.DataFrame()
+
+    # Show which files were found (helps with debugging)
+    st.sidebar.markdown("**Sales files found:**")
+    for f in sorted(sales_files, key=lambda x: x["name"]):
+        st.sidebar.caption(f"• {f['name']}")
 
     all_data = []
 
@@ -79,17 +115,13 @@ def load_sales_data():
         print(f"Loading {'[LIVE] ' if live else ''}Sales: {f['name']}")
 
         try:
-            # Use appropriate TTL cache based on whether file is current month
-            if live:
-                df = _load_file_live(f["id"])
-            else:
-                df = _load_file_cached(f["id"])
+            df = _load_file_live(f["id"]) if live else _load_file_cached(f["id"])
 
             df = clean_columns(df)
-            df["Month_File"]  = month
-            df["Year_File"]   = year
-            df["SourceFile"]  = f["name"]
-            df["IsLive"]      = live
+            df["Month_File"] = month
+            df["Year_File"]  = year
+            df["SourceFile"] = f["name"]
+            df["IsLive"]     = live
 
             if "Date" in df.columns:
                 df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
@@ -101,7 +133,7 @@ def load_sales_data():
             continue
 
     if not all_data:
-        st.error("No sales data could be loaded.")
+        st.error("Sales files were found but could not be read.")
         return pd.DataFrame()
 
     return pd.concat(all_data, ignore_index=True)
@@ -109,16 +141,29 @@ def load_sales_data():
 
 # ----------------------------------------------------------
 # LOAD ALL TARGET FILES
+# Searches all subfolders recursively — finds files even if
+# they are inside "Targets_Spreads" subfolder
 # ----------------------------------------------------------
 def load_targets_data():
-    import streamlit as st
+    all_files = list_all_files_recursive(FOLDER_ID)
 
-    files = list_files_in_folder(FOLDER_ID)
-    target_files = [f for f in files if "target" in f["name"].lower()]
+    # Filter: files whose name contains "target" (case-insensitive)
+    target_files = [
+        f for f in all_files
+        if "target" in f["name"].lower()
+    ]
 
     if not target_files:
-        st.warning("No target files found in the Google Drive folder.")
+        st.warning(
+            "No target files found. Make sure your files are named like "
+            "'1 Targets 2024.csv' and are in the correct Google Drive folder."
+        )
         return pd.DataFrame()
+
+    # Show which target files were found
+    st.sidebar.markdown("**Target files found:**")
+    for f in sorted(target_files, key=lambda x: x["name"]):
+        st.sidebar.caption(f"• {f['name']}")
 
     all_data = []
 
@@ -145,23 +190,7 @@ def load_targets_data():
 
 
 # ----------------------------------------------------------
-# CACHED LOADERS
-# _load_file_cached  → 24 hours  (old months, targets)
-# _load_file_live    → 5 minutes (current month)
-# ----------------------------------------------------------
-import streamlit as st
-
-@st.cache_data(ttl=86400, show_spinner=False)
-def _load_file_cached(file_id):
-    return read_drive_file(file_id)
-
-@st.cache_data(ttl=300, show_spinner=False)
-def _load_file_live(file_id):
-    return read_drive_file(file_id)
-
-
-# ----------------------------------------------------------
-# CREATE TIME FEATURES
+# CREATE TIME FEATURES (MTD, QTD, YTD cumulative columns)
 # ----------------------------------------------------------
 def create_time_features(df):
     if df.empty:
@@ -172,7 +201,6 @@ def create_time_features(df):
     df["Month"]   = df["Date"].dt.month
     df["Quarter"] = df["Date"].dt.quarter
 
-    # Cumulative sales within each period
     df = df.sort_values("Date")
 
     df["MTD"] = df.groupby(["Year", "Month"])["Sales"].cumsum()
@@ -184,16 +212,21 @@ def create_time_features(df):
 
 # ----------------------------------------------------------
 # MERGE SALES + TARGETS
+# Only merges on columns that actually exist in both files
 # ----------------------------------------------------------
 def merge_sales_with_targets(sales, targets):
     if targets.empty:
-        # No targets yet — add empty columns so app doesn't crash
         sales["Sales_Targets"] = 0
         return sales
 
-    # Determine shared merge keys (only use columns that exist in both)
-    possible_keys = ["Distributor", "DT_Name", "FSR_code", "FSR", "Brand", "Month_File", "Year_File"]
-    merge_keys = [k for k in possible_keys if k in sales.columns and k in targets.columns]
+    possible_keys = [
+        "Distributor", "DT_Name", "FSR_code",
+        "FSR", "Brand", "Month_File", "Year_File"
+    ]
+    merge_keys = [
+        k for k in possible_keys
+        if k in sales.columns and k in targets.columns
+    ]
 
     merged = sales.merge(
         targets,
@@ -202,7 +235,6 @@ def merge_sales_with_targets(sales, targets):
         suffixes=("", "_target")
     )
 
-    # Fill missing targets with 0
     if "Sales_Targets" in merged.columns:
         merged["Sales_Targets"] = merged["Sales_Targets"].fillna(0)
     else:

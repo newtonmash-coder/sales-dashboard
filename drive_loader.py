@@ -1,6 +1,7 @@
 # ==========================================================
 # drive_loader.py
-# FIXED VERSION — auto-detects CSV vs Excel correctly
+# FIXED — handles Google Sheets (export), real CSVs,
+#          and searches subfolders recursively
 # ==========================================================
 
 import os
@@ -16,8 +17,14 @@ import streamlit as st
 
 
 # ----------------------------------------------------------
+# MIME TYPE CONSTANTS
+# ----------------------------------------------------------
+MIME_GOOGLE_SHEET  = "application/vnd.google-apps.spreadsheet"
+MIME_GOOGLE_FOLDER = "application/vnd.google-apps.folder"
+
+
+# ----------------------------------------------------------
 # GOOGLE DRIVE AUTH
-# Reads GOOGLE_CREDS from Render Environment Variable
 # ----------------------------------------------------------
 @st.cache_resource
 def get_drive_service():
@@ -32,7 +39,7 @@ def get_drive_service():
 
 
 # ----------------------------------------------------------
-# LIST FILES IN FOLDER
+# LIST FILES IN A SINGLE FOLDER
 # ----------------------------------------------------------
 def list_files_in_folder(folder_id):
     service = get_drive_service()
@@ -46,80 +53,112 @@ def list_files_in_folder(folder_id):
 
 
 # ----------------------------------------------------------
-# DOWNLOAD RAW FILE BYTES
+# LIST ALL FILES RECURSIVELY (searches subfolders too)
+# Fixes: sales files inside subfolder "Spread" were not found
 # ----------------------------------------------------------
-def download_file(file_id):
+def list_all_files_recursive(folder_id):
+    """
+    Returns all non-folder files under folder_id,
+    including files inside any subfolders (any depth).
+    """
+    all_files = []
+    items = list_files_in_folder(folder_id)
+
+    for item in items:
+        if item["mimeType"] == MIME_GOOGLE_FOLDER:
+            # Recurse into subfolder
+            sub_files = list_all_files_recursive(item["id"])
+            all_files.extend(sub_files)
+        else:
+            all_files.append(item)
+
+    return all_files
+
+
+# ----------------------------------------------------------
+# DOWNLOAD FILE BYTES
+# Google Sheets must use export_media (get_media = 403 error)
+# Real files use get_media directly
+# ----------------------------------------------------------
+def download_file_bytes(file_id):
+    """Returns (BytesIO data, filename, is_google_sheet)"""
     service = get_drive_service()
 
-    # First check if it's a Google Sheet (needs export)
     file_meta = service.files().get(
         fileId=file_id,
         fields="mimeType,name"
     ).execute()
 
-    mime = file_meta.get("mimeType", "")
+    mime     = file_meta.get("mimeType", "")
+    filename = file_meta.get("name", "")
 
-    # Google Sheets → export as CSV
-    if mime == "application/vnd.google-apps.spreadsheet":
-        request = service.files().export_media(
+    if mime == MIME_GOOGLE_SHEET:
+        # Google Sheet — export as CSV (downloading directly = 403)
+        request  = service.files().export_media(
             fileId=file_id,
             mimeType="text/csv"
         )
+        is_sheet = True
     else:
-        request = service.files().get_media(fileId=file_id)
+        # Real uploaded file — download bytes directly
+        request  = service.files().get_media(fileId=file_id)
+        is_sheet = False
 
-    file_data = BytesIO()
-    downloader = MediaIoBaseDownload(file_data, request)
+    buf = BytesIO()
+    downloader = MediaIoBaseDownload(buf, request)
     done = False
     while not done:
         _, done = downloader.next_chunk()
-    file_data.seek(0)
-    return file_data, file_meta.get("name", "")
+    buf.seek(0)
+
+    return buf, filename, is_sheet
 
 
 # ----------------------------------------------------------
-# SMART READ — detects CSV vs Excel from filename/mimeType
+# READ ANY DRIVE FILE → pandas DataFrame
 # ----------------------------------------------------------
 def read_drive_file(file_id):
-    """
-    Downloads a file from Google Drive and returns a DataFrame.
-    Automatically handles: .csv, .xlsx, .xls, Google Sheets.
-    """
-    file_data, filename = download_file(file_id)
+    buf, filename, is_sheet = download_file_bytes(file_id)
     name_lower = filename.lower()
 
-    # Try CSV first (covers .csv and Google Sheets exported as CSV)
+    # Google Sheets exported as CSV
+    if is_sheet:
+        try:
+            return pd.read_csv(buf)
+        except Exception as e:
+            raise ValueError(f"Google Sheet '{filename}' could not be read as CSV: {e}")
+
+    # Real .csv file
     if name_lower.endswith(".csv"):
         try:
-            return pd.read_csv(file_data)
+            return pd.read_csv(buf)
         except Exception as e:
-            raise ValueError(f"Failed to read CSV '{filename}': {e}")
+            raise ValueError(f"CSV '{filename}' could not be read: {e}")
 
-    # Try Excel formats
+    # Real Excel file
     if name_lower.endswith(".xlsx") or name_lower.endswith(".xls"):
         try:
-            return pd.read_excel(file_data, engine="openpyxl")
+            return pd.read_excel(buf, engine="openpyxl")
         except Exception:
-            # Fallback: maybe it was saved as CSV with xlsx name
-            file_data.seek(0)
+            buf.seek(0)
             try:
-                return pd.read_csv(file_data)
+                return pd.read_csv(buf)
             except Exception as e:
-                raise ValueError(f"Failed to read '{filename}' as Excel or CSV: {e}")
+                raise ValueError(f"'{filename}' could not be read as Excel or CSV: {e}")
 
     # Unknown extension — try CSV then Excel
     try:
-        return pd.read_csv(file_data)
+        return pd.read_csv(buf)
     except Exception:
-        file_data.seek(0)
+        buf.seek(0)
         try:
-            return pd.read_excel(file_data, engine="openpyxl")
+            return pd.read_excel(buf, engine="openpyxl")
         except Exception as e:
-            raise ValueError(f"Could not read '{filename}' as CSV or Excel: {e}")
+            raise ValueError(f"Cannot read '{filename}': {e}")
 
 
 # ----------------------------------------------------------
-# KEPT FOR BACKWARD COMPATIBILITY
+# BACKWARD-COMPATIBLE ALIASES
 # ----------------------------------------------------------
 def download_excel_file(file_id):
     return read_drive_file(file_id)
