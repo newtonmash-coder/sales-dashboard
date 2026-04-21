@@ -1,6 +1,7 @@
 # ==========================================================
 # app.py
-# FIXED VERSION — handles CSV files, better error display
+# OPTIMISED — full dataset cached at top level so Render
+# does not reload data on every user interaction
 # ==========================================================
 
 import streamlit as st
@@ -25,12 +26,12 @@ st.set_page_config(
 st.title("📊 Spread Masters Sales Dashboard")
 
 # ----------------------------------------------------------
-# SIDEBAR — Refresh button at the top
+# SIDEBAR
 # ----------------------------------------------------------
 st.sidebar.title("Spread Masters")
 st.sidebar.markdown("---")
 
-if st.sidebar.button("🔄 Refresh Current Month Data"):
+if st.sidebar.button("🔄 Refresh Data Now"):
     st.cache_data.clear()
     st.rerun()
 
@@ -38,8 +39,12 @@ st.sidebar.caption("Current month auto-refreshes every 5 mins")
 st.sidebar.markdown("---")
 
 # ----------------------------------------------------------
-# LOAD DATA
+# LOAD & CACHE THE FULL MERGED DATASET
+# Decorated with cache so it only runs ONCE on startup,
+# then serves from memory for all subsequent interactions.
+# TTL=300 matches the live-file refresh interval.
 # ----------------------------------------------------------
+@st.cache_data(ttl=300, show_spinner="Loading data from Google Drive...")
 def load_all_data():
     sales   = load_sales_data()
     targets = load_targets_data()
@@ -52,14 +57,13 @@ def load_all_data():
     return df
 
 
-with st.spinner("Loading data from Google Drive..."):
-    df = load_all_data()
+df = load_all_data()
 
 if df.empty:
     st.error("No data could be loaded. Check your Google Drive folder ID and file names.")
     st.stop()
 
-st.success(f"✅ Data loaded — {len(df):,} rows from {df['SourceFile'].nunique()} file(s)")
+st.success(f"✅ {len(df):,} rows loaded from {df['SourceFile'].nunique()} file(s)")
 
 # ----------------------------------------------------------
 # CLEAN DATE
@@ -67,13 +71,16 @@ st.success(f"✅ Data loaded — {len(df):,} rows from {df['SourceFile'].nunique
 df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
 df = df.sort_values("Date")
 
-# Guard: ensure required columns exist
-required_cols = ["Year", "Month", "DT_Name", "Brand", "FSR", "Sales", "Sales_Targets", "outlet_code"]
+# ----------------------------------------------------------
+# COLUMN GUARD
+# ----------------------------------------------------------
+required_cols = ["Year", "Month", "DT_Name", "Brand", "FSR",
+                 "Sales", "Sales_Targets", "outlet_code"]
 missing_cols  = [c for c in required_cols if c not in df.columns]
 
 if missing_cols:
-    st.error(f"These columns are missing from your data: {missing_cols}")
-    st.info(f"Columns found: {list(df.columns)}")
+    st.error(f"Missing columns: {missing_cols}")
+    st.info(f"Columns in your data: {list(df.columns)}")
     st.stop()
 
 # ----------------------------------------------------------
@@ -123,7 +130,6 @@ filtered = base[
 # QTD / YTD
 # ----------------------------------------------------------
 selected_quarter = filtered["Quarter"].max() if not filtered.empty else 1
-
 qtd_data = base[(base["Year"] == year_filter) & (base["Quarter"] == selected_quarter)].copy()
 ytd_data = base[base["Year"] == year_filter].copy()
 
@@ -178,14 +184,14 @@ with tab1:
     st.subheader("📌 Executive KPIs")
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Sales",          f"{total_sales:,.0f}")
-    c2.metric("Targets",        f"{total_target:,.0f}")
-    c3.metric("Achievement %",  f"{achievement:.1f}%")
-    c4.metric("Customers MTD",  f"{cust_mtd:,}")
+    c1.metric("Sales",         f"{total_sales:,.0f}")
+    c2.metric("Targets",       f"{total_target:,.0f}")
+    c3.metric("Achievement %", f"{achievement:.1f}%")
+    c4.metric("Customers MTD", f"{cust_mtd:,}")
 
     c5, c6, c7 = st.columns(3)
-    c5.metric("Customers QTD",   f"{cust_qtd:,}")
-    c6.metric("Customers YTD",   f"{cust_ytd:,}")
+    c5.metric("Customers QTD",    f"{cust_qtd:,}")
+    c6.metric("Customers YTD",    f"{cust_ytd:,}")
     c7.metric("Net Outlet Growth", f"{len(new_customers) - len(lost_customers):,}")
 
 # ==========================================================
@@ -229,9 +235,9 @@ with tab2:
     potential_total = base["outlet_code"].nunique()
     score["Strike Rate %"] = (score["Customers Billed"] / potential_total * 100)
 
-    score["Sales Score"]  = (score["Achievement %"]   / score["Achievement %"].max())   * 40
+    score["Sales Score"]  = (score["Achievement %"]    / score["Achievement %"].max())    * 40
     score["Reach Score"]  = (score["Customers Billed"] / score["Customers Billed"].max()) * 25
-    score["Strike Score"] = (score["Strike Rate %"]   / score["Strike Rate %"].max())   * 20
+    score["Strike Score"] = (score["Strike Rate %"]    / score["Strike Rate %"].max())    * 20
     score["Total Score"]  = (score["Sales Score"] + score["Reach Score"] + score["Strike Score"]).round(1)
     score = score.sort_values("Total Score", ascending=False).reset_index(drop=True)
 
@@ -253,7 +259,7 @@ with tab3:
     )
     rpt = filtered.merge(first_purchase, on="outlet_code", how="left")
     rpt["Type"] = np.where(
-        (rpt["First_Date"].dt.year == year_filter) &
+        (rpt["First_Date"].dt.year  == year_filter) &
         (rpt["First_Date"].dt.month == month_filter),
         "New", "Repeat"
     )
@@ -269,7 +275,7 @@ with tab3:
         ][["outlet_code", "FSR", "DT_Name", "Brand"]].drop_duplicates()
         st.dataframe(lost_df, use_container_width=True)
     else:
-        st.info("No previous month data to compare.")
+        st.info("No previous month data available to compare.")
 
     st.subheader("🅲 Billing Frequency")
     freq = (
@@ -285,16 +291,22 @@ with tab3:
 with tab4:
     st.subheader("📦 Numeric Distribution")
     num_dist = filtered.groupby("Brand")["outlet_code"].nunique().reset_index()
-    num_dist["Numeric Distribution %"] = (num_dist["outlet_code"] / cust_mtd * 100).round(1) if cust_mtd > 0 else 0
+    num_dist["Numeric Distribution %"] = (
+        (num_dist["outlet_code"] / cust_mtd * 100).round(1)
+        if cust_mtd > 0 else 0
+    )
     st.dataframe(num_dist, use_container_width=True)
 
     st.subheader("🏪 Weighted Distribution")
-    market = filtered.groupby("outlet_code")["Sales"].sum().reset_index()
+    market       = filtered.groupby("outlet_code")["Sales"].sum().reset_index()
     total_market = market["Sales"].sum()
-    brand = filtered.groupby(["Brand", "outlet_code"])["Sales"].sum().reset_index()
-    brand = brand.merge(market, on="outlet_code", suffixes=("_Brand", "_Outlet"))
-    wd = brand.groupby("Brand").agg({"Sales_Outlet": "sum"}).reset_index()
-    wd["Weighted Distribution %"] = (wd["Sales_Outlet"] / total_market * 100).round(1) if total_market > 0 else 0
+    brand_df     = filtered.groupby(["Brand", "outlet_code"])["Sales"].sum().reset_index()
+    brand_df     = brand_df.merge(market, on="outlet_code", suffixes=("_Brand", "_Outlet"))
+    wd           = brand_df.groupby("Brand").agg({"Sales_Outlet": "sum"}).reset_index()
+    wd["Weighted Distribution %"] = (
+        (wd["Sales_Outlet"] / total_market * 100).round(1)
+        if total_market > 0 else 0
+    )
     st.dataframe(wd, use_container_width=True)
 
     st.subheader("🔎 Brand → SKU Sales")
