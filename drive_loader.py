@@ -96,12 +96,19 @@ def download_excel_file(file_id):
 
     file_data = download_file(file_id)
 
-    df = pd.read_excel(
-        file_data,
-        engine="openpyxl"
-    )
+    try:
+        df = pd.read_excel(
+            file_data,
+            engine="openpyxl"
+        )
+        return df
 
-    return df
+    except:
+        file_data.seek(0)
+
+        df = pd.read_csv(file_data)
+
+        return df
 
 
 # ----------------------------------------------------------
