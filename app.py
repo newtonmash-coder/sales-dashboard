@@ -1,0 +1,452 @@
+# ==========================================================
+# app.py
+# FULL FINAL ENTERPRISE VERSION
+# Preserves all original logic + tabs structure
+# ==========================================================
+
+import streamlit as st
+import pandas as pd
+import numpy as np
+
+from data_engine import (
+    load_sales_data,
+    load_targets_data,
+    create_time_features,
+    merge_sales_with_targets
+)
+
+# ----------------------------------------------------------
+# PAGE CONFIG
+# ----------------------------------------------------------
+st.set_page_config(
+    page_title="Spread Masters Sales Dashboard",
+    layout="wide"
+)
+
+st.title("📊 Spread Masters Sales Dashboard")
+
+# ----------------------------------------------------------
+# LOAD DATA
+# ----------------------------------------------------------
+@st.cache_data(show_spinner=True)
+def load_all_data():
+
+    sales = load_sales_data()
+    targets = load_targets_data()
+
+    sales = create_time_features(sales)
+
+    df = merge_sales_with_targets(
+        sales,
+        targets
+    )
+
+    return df
+
+
+with st.spinner("Loading data from Google Drive..."):
+    df = load_all_data()
+
+st.success("Data Loaded Successfully!")
+
+# ----------------------------------------------------------
+# CLEAN DATE
+# ----------------------------------------------------------
+df["Date"] = pd.to_datetime(
+    df["Date"],
+    errors="coerce"
+)
+
+df = df.sort_values("Date")
+
+# ----------------------------------------------------------
+# SIDEBAR FILTERS
+# ----------------------------------------------------------
+st.sidebar.header("Filters")
+
+year_filter = st.sidebar.selectbox(
+    "Select Year",
+    sorted(df["Year"].dropna().unique(), reverse=True)
+)
+
+month_filter = st.sidebar.selectbox(
+    "Select Month",
+    sorted(df["Month"].dropna().unique())
+)
+
+dt_filter = st.sidebar.multiselect(
+    "Select DT_Name",
+    sorted(df["DT_Name"].dropna().unique())
+)
+
+brand_filter = st.sidebar.multiselect(
+    "Select Brand",
+    sorted(df["Brand"].dropna().unique())
+)
+
+fsr_filter = st.sidebar.multiselect(
+    "Select FSR",
+    sorted(df["FSR"].dropna().unique())
+)
+
+# ----------------------------------------------------------
+# BASE FILTER
+# ----------------------------------------------------------
+base = df.copy()
+
+if dt_filter:
+    base = base[base["DT_Name"].isin(dt_filter)]
+
+if brand_filter:
+    base = base[base["Brand"].isin(brand_filter)]
+
+if fsr_filter:
+    base = base[base["FSR"].isin(fsr_filter)]
+
+filtered = base[
+    (base["Year"] == year_filter) &
+    (base["Month"] == month_filter)
+].copy()
+
+# ----------------------------------------------------------
+# QTD / YTD
+# ----------------------------------------------------------
+selected_quarter = filtered["Quarter"].max()
+
+qtd_data = base[
+    (base["Year"] == year_filter) &
+    (base["Quarter"] == selected_quarter)
+].copy()
+
+ytd_data = base[
+    base["Year"] == year_filter
+].copy()
+
+# ----------------------------------------------------------
+# PREVIOUS MONTH
+# ----------------------------------------------------------
+prev_month = month_filter - 1
+prev_year = year_filter
+
+if prev_month == 0:
+    prev_month = 12
+    prev_year -= 1
+
+previous_data = base[
+    (base["Year"] == prev_year) &
+    (base["Month"] == prev_month)
+].copy()
+
+# ----------------------------------------------------------
+# CUSTOMER SETS
+# ----------------------------------------------------------
+prev_customers = set(
+    previous_data["outlet_code"].dropna().unique()
+)
+
+curr_customers = set(
+    filtered["outlet_code"].dropna().unique()
+)
+
+lost_customers = prev_customers - curr_customers
+new_customers = curr_customers - prev_customers
+
+# ----------------------------------------------------------
+# KPI VALUES
+# ----------------------------------------------------------
+total_sales = filtered["Sales"].sum()
+total_target = filtered["Sales_Targets"].sum()
+
+achievement = (
+    total_sales / total_target * 100
+    if total_target > 0 else 0
+)
+
+cust_mtd = filtered["outlet_code"].nunique()
+cust_qtd = qtd_data["outlet_code"].nunique()
+cust_ytd = ytd_data["outlet_code"].nunique()
+
+# ----------------------------------------------------------
+# TABS
+# ----------------------------------------------------------
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "Executive Summary",
+    "FSR Performance",
+    "Customer Analytics",
+    "Brand Analytics",
+    "Raw Data"
+])
+
+# ==========================================================
+# TAB 1 EXECUTIVE SUMMARY
+# ==========================================================
+with tab1:
+
+    st.subheader("📌 Executive KPIs")
+
+    c1, c2, c3, c4 = st.columns(4)
+
+    c1.metric("Sales", f"{total_sales:,.0f}")
+    c2.metric("Targets", f"{total_target:,.0f}")
+    c3.metric("Achievement %", f"{achievement:.1f}%")
+    c4.metric("Customers MTD", f"{cust_mtd:,}")
+
+    c5, c6, c7 = st.columns(3)
+
+    c5.metric("Customers QTD", f"{cust_qtd:,}")
+    c6.metric("Customers YTD", f"{cust_ytd:,}")
+    c7.metric("Net Outlet Growth",
+              len(new_customers) - len(lost_customers))
+
+# ==========================================================
+# TAB 2 FSR PERFORMANCE
+# ==========================================================
+with tab2:
+
+    st.subheader("📌 FSR Performance")
+
+    fsr_table = (
+        filtered.groupby(["FSR", "Brand"])
+        .agg({
+            "Sales": "sum",
+            "Sales_Targets": "sum"
+        })
+        .reset_index()
+    )
+
+    fsr_table["Achievement %"] = np.where(
+        fsr_table["Sales_Targets"] > 0,
+        fsr_table["Sales"] /
+        fsr_table["Sales_Targets"] * 100,
+        0
+    ).round(1)
+
+    st.dataframe(fsr_table, use_container_width=True)
+
+    st.subheader("📌 FSR Reach")
+
+    reach = (
+        filtered.groupby("FSR")
+        .agg({
+            "Sales": "sum",
+            "outlet_code": pd.Series.nunique
+        })
+        .reset_index()
+    )
+
+    reach.rename(columns={
+        "outlet_code": "Customers Billed"
+    }, inplace=True)
+
+    reach["Avg Sale per Outlet"] = (
+        reach["Sales"] /
+        reach["Customers Billed"]
+    ).round(2)
+
+    st.dataframe(reach, use_container_width=True)
+
+# ==========================================================
+# FSR SCORECARD
+# ==========================================================
+    st.subheader("🏆 FSR Scorecard")
+
+    score = reach.copy()
+
+    score = score.merge(
+        fsr_table.groupby("FSR")[
+            ["Sales_Targets"]
+        ].sum().reset_index(),
+        on="FSR",
+        how="left"
+    )
+
+    score["Achievement %"] = np.where(
+        score["Sales_Targets"] > 0,
+        score["Sales"] /
+        score["Sales_Targets"] * 100,
+        0
+    )
+
+    potential_total = base["outlet_code"].nunique()
+
+    score["Strike Rate %"] = (
+        score["Customers Billed"] /
+        potential_total * 100
+    )
+
+    score["Sales Score"] = (
+        score["Achievement %"] /
+        score["Achievement %"].max()
+    ) * 40
+
+    score["Reach Score"] = (
+        score["Customers Billed"] /
+        score["Customers Billed"].max()
+    ) * 25
+
+    score["Strike Score"] = (
+        score["Strike Rate %"] /
+        score["Strike Rate %"].max()
+    ) * 20
+
+    score["Total Score"] = (
+        score["Sales Score"] +
+        score["Reach Score"] +
+        score["Strike Score"]
+    ).round(1)
+
+    score = score.sort_values(
+        "Total Score",
+        ascending=False
+    ).reset_index(drop=True)
+
+    medals = ["🥇", "🥈", "🥉"]
+
+    score["Award"] = ""
+
+    for i in range(min(3, len(score))):
+        score.loc[i, "Award"] = medals[i]
+
+    st.dataframe(score, use_container_width=True)
+
+# ==========================================================
+# TAB 3 CUSTOMER ANALYTICS
+# ==========================================================
+with tab3:
+
+    st.subheader("🅰 Repeat vs New")
+
+    first_purchase = (
+        df.groupby("outlet_code")["Date"]
+        .min()
+        .reset_index()
+        .rename(columns={"Date": "First_Date"})
+    )
+
+    rpt = filtered.merge(
+        first_purchase,
+        on="outlet_code",
+        how="left"
+    )
+
+    rpt["Type"] = np.where(
+        (rpt["First_Date"].dt.year == year_filter) &
+        (rpt["First_Date"].dt.month == month_filter),
+        "New",
+        "Repeat"
+    )
+
+    st.dataframe(
+        rpt.groupby("Type")["outlet_code"]
+        .nunique()
+        .reset_index(),
+        use_container_width=True
+    )
+
+    st.subheader("🚨 Lost Customers")
+
+    lost_df = previous_data[
+        previous_data["outlet_code"]
+        .isin(lost_customers)
+    ][[
+        "outlet_code",
+        "FSR",
+        "DT_Name",
+        "Brand"
+    ]].drop_duplicates()
+
+    st.dataframe(lost_df, use_container_width=True)
+
+    st.subheader("🅲 Billing Frequency")
+
+    freq = (
+        filtered.groupby("outlet_code")
+        .size()
+        .reset_index(name="Billing Count")
+        .sort_values(
+            "Billing Count",
+            ascending=False
+        )
+    )
+
+    st.dataframe(freq, use_container_width=True)
+
+# ==========================================================
+# TAB 4 BRAND ANALYTICS
+# ==========================================================
+with tab4:
+
+    st.subheader("📦 Numeric Distribution")
+
+    num_dist = (
+        filtered.groupby("Brand")["outlet_code"]
+        .nunique()
+        .reset_index()
+    )
+
+    num_dist["Numeric Distribution %"] = (
+        num_dist["outlet_code"] /
+        cust_mtd * 100
+    ).round(1)
+
+    st.dataframe(num_dist, use_container_width=True)
+
+    st.subheader("🏪 Weighted Distribution")
+
+    market = (
+        filtered.groupby("outlet_code")["Sales"]
+        .sum()
+        .reset_index()
+    )
+
+    total_market = market["Sales"].sum()
+
+    brand = (
+        filtered.groupby(["Brand", "outlet_code"])
+        ["Sales"].sum().reset_index()
+    )
+
+    brand = brand.merge(
+        market,
+        on="outlet_code",
+        suffixes=("_Brand", "_Outlet")
+    )
+
+    wd = (
+        brand.groupby("Brand")
+        .agg({"Sales_Outlet": "sum"})
+        .reset_index()
+    )
+
+    wd["Weighted Distribution %"] = (
+        wd["Sales_Outlet"] /
+        total_market * 100
+    ).round(1)
+
+    st.dataframe(wd, use_container_width=True)
+
+    st.subheader("🔎 Brand → SKU Sales")
+
+    sku = (
+        filtered.groupby(["Brand", "SKU"])
+        .agg({"Sales": "sum"})
+        .reset_index()
+        .sort_values(
+            "Sales",
+            ascending=False
+        )
+    )
+
+    st.dataframe(sku, use_container_width=True)
+
+# ==========================================================
+# TAB 5 RAW DATA
+# ==========================================================
+with tab5:
+
+    st.subheader("📄 Detailed Raw Data")
+
+    st.dataframe(
+        filtered,
+        use_container_width=True
+    )
