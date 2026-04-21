@@ -1,7 +1,6 @@
 # ==========================================================
 # app.py
-# FULL FINAL ENTERPRISE VERSION
-# Preserves all original logic + tabs structure
+# FIXED VERSION — handles CSV files, better error display
 # ==========================================================
 
 import streamlit as st
@@ -26,38 +25,56 @@ st.set_page_config(
 st.title("📊 Spread Masters Sales Dashboard")
 
 # ----------------------------------------------------------
+# SIDEBAR — Refresh button at the top
+# ----------------------------------------------------------
+st.sidebar.title("Spread Masters")
+st.sidebar.markdown("---")
+
+if st.sidebar.button("🔄 Refresh Current Month Data"):
+    st.cache_data.clear()
+    st.rerun()
+
+st.sidebar.caption("Current month auto-refreshes every 5 mins")
+st.sidebar.markdown("---")
+
+# ----------------------------------------------------------
 # LOAD DATA
 # ----------------------------------------------------------
-@st.cache_data(show_spinner=True)
 def load_all_data():
-
-    sales = load_sales_data()
+    sales   = load_sales_data()
     targets = load_targets_data()
 
+    if sales.empty:
+        return pd.DataFrame()
+
     sales = create_time_features(sales)
-
-    df = merge_sales_with_targets(
-        sales,
-        targets
-    )
-
+    df    = merge_sales_with_targets(sales, targets)
     return df
 
 
 with st.spinner("Loading data from Google Drive..."):
     df = load_all_data()
 
-st.success("Data Loaded Successfully!")
+if df.empty:
+    st.error("No data could be loaded. Check your Google Drive folder ID and file names.")
+    st.stop()
+
+st.success(f"✅ Data loaded — {len(df):,} rows from {df['SourceFile'].nunique()} file(s)")
 
 # ----------------------------------------------------------
 # CLEAN DATE
 # ----------------------------------------------------------
-df["Date"] = pd.to_datetime(
-    df["Date"],
-    errors="coerce"
-)
-
+df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
 df = df.sort_values("Date")
+
+# Guard: ensure required columns exist
+required_cols = ["Year", "Month", "DT_Name", "Brand", "FSR", "Sales", "Sales_Targets", "outlet_code"]
+missing_cols  = [c for c in required_cols if c not in df.columns]
+
+if missing_cols:
+    st.error(f"These columns are missing from your data: {missing_cols}")
+    st.info(f"Columns found: {list(df.columns)}")
+    st.stop()
 
 # ----------------------------------------------------------
 # SIDEBAR FILTERS
@@ -93,74 +110,51 @@ fsr_filter = st.sidebar.multiselect(
 # BASE FILTER
 # ----------------------------------------------------------
 base = df.copy()
-
-if dt_filter:
-    base = base[base["DT_Name"].isin(dt_filter)]
-
-if brand_filter:
-    base = base[base["Brand"].isin(brand_filter)]
-
-if fsr_filter:
-    base = base[base["FSR"].isin(fsr_filter)]
+if dt_filter:    base = base[base["DT_Name"].isin(dt_filter)]
+if brand_filter: base = base[base["Brand"].isin(brand_filter)]
+if fsr_filter:   base = base[base["FSR"].isin(fsr_filter)]
 
 filtered = base[
-    (base["Year"] == year_filter) &
+    (base["Year"]  == year_filter) &
     (base["Month"] == month_filter)
 ].copy()
 
 # ----------------------------------------------------------
 # QTD / YTD
 # ----------------------------------------------------------
-selected_quarter = filtered["Quarter"].max()
+selected_quarter = filtered["Quarter"].max() if not filtered.empty else 1
 
-qtd_data = base[
-    (base["Year"] == year_filter) &
-    (base["Quarter"] == selected_quarter)
-].copy()
-
-ytd_data = base[
-    base["Year"] == year_filter
-].copy()
+qtd_data = base[(base["Year"] == year_filter) & (base["Quarter"] == selected_quarter)].copy()
+ytd_data = base[base["Year"] == year_filter].copy()
 
 # ----------------------------------------------------------
 # PREVIOUS MONTH
 # ----------------------------------------------------------
 prev_month = month_filter - 1
-prev_year = year_filter
-
+prev_year  = year_filter
 if prev_month == 0:
     prev_month = 12
     prev_year -= 1
 
 previous_data = base[
-    (base["Year"] == prev_year) &
+    (base["Year"]  == prev_year) &
     (base["Month"] == prev_month)
 ].copy()
 
 # ----------------------------------------------------------
 # CUSTOMER SETS
 # ----------------------------------------------------------
-prev_customers = set(
-    previous_data["outlet_code"].dropna().unique()
-)
-
-curr_customers = set(
-    filtered["outlet_code"].dropna().unique()
-)
-
+prev_customers = set(previous_data["outlet_code"].dropna().unique())
+curr_customers = set(filtered["outlet_code"].dropna().unique())
 lost_customers = prev_customers - curr_customers
-new_customers = curr_customers - prev_customers
+new_customers  = curr_customers - prev_customers
 
 # ----------------------------------------------------------
 # KPI VALUES
 # ----------------------------------------------------------
-total_sales = filtered["Sales"].sum()
+total_sales  = filtered["Sales"].sum()
 total_target = filtered["Sales_Targets"].sum()
-
-achievement = (
-    total_sales / total_target * 100
-    if total_target > 0 else 0
-)
+achievement  = (total_sales / total_target * 100) if total_target > 0 else 0
 
 cust_mtd = filtered["outlet_code"].nunique()
 cust_qtd = qtd_data["outlet_code"].nunique()
@@ -178,275 +172,141 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs([
 ])
 
 # ==========================================================
-# TAB 1 EXECUTIVE SUMMARY
+# TAB 1 — EXECUTIVE SUMMARY
 # ==========================================================
 with tab1:
-
     st.subheader("📌 Executive KPIs")
 
     c1, c2, c3, c4 = st.columns(4)
-
-    c1.metric("Sales", f"{total_sales:,.0f}")
-    c2.metric("Targets", f"{total_target:,.0f}")
-    c3.metric("Achievement %", f"{achievement:.1f}%")
-    c4.metric("Customers MTD", f"{cust_mtd:,}")
+    c1.metric("Sales",          f"{total_sales:,.0f}")
+    c2.metric("Targets",        f"{total_target:,.0f}")
+    c3.metric("Achievement %",  f"{achievement:.1f}%")
+    c4.metric("Customers MTD",  f"{cust_mtd:,}")
 
     c5, c6, c7 = st.columns(3)
-
-    c5.metric("Customers QTD", f"{cust_qtd:,}")
-    c6.metric("Customers YTD", f"{cust_ytd:,}")
-    c7.metric("Net Outlet Growth",
-              len(new_customers) - len(lost_customers))
+    c5.metric("Customers QTD",   f"{cust_qtd:,}")
+    c6.metric("Customers YTD",   f"{cust_ytd:,}")
+    c7.metric("Net Outlet Growth", f"{len(new_customers) - len(lost_customers):,}")
 
 # ==========================================================
-# TAB 2 FSR PERFORMANCE
+# TAB 2 — FSR PERFORMANCE
 # ==========================================================
 with tab2:
-
     st.subheader("📌 FSR Performance")
 
     fsr_table = (
         filtered.groupby(["FSR", "Brand"])
-        .agg({
-            "Sales": "sum",
-            "Sales_Targets": "sum"
-        })
+        .agg({"Sales": "sum", "Sales_Targets": "sum"})
         .reset_index()
     )
-
     fsr_table["Achievement %"] = np.where(
         fsr_table["Sales_Targets"] > 0,
-        fsr_table["Sales"] /
-        fsr_table["Sales_Targets"] * 100,
+        (fsr_table["Sales"] / fsr_table["Sales_Targets"] * 100).round(1),
         0
-    ).round(1)
-
+    )
     st.dataframe(fsr_table, use_container_width=True)
 
     st.subheader("📌 FSR Reach")
-
     reach = (
         filtered.groupby("FSR")
-        .agg({
-            "Sales": "sum",
-            "outlet_code": pd.Series.nunique
-        })
+        .agg({"Sales": "sum", "outlet_code": pd.Series.nunique})
         .reset_index()
+        .rename(columns={"outlet_code": "Customers Billed"})
     )
-
-    reach.rename(columns={
-        "outlet_code": "Customers Billed"
-    }, inplace=True)
-
-    reach["Avg Sale per Outlet"] = (
-        reach["Sales"] /
-        reach["Customers Billed"]
-    ).round(2)
-
+    reach["Avg Sale per Outlet"] = (reach["Sales"] / reach["Customers Billed"]).round(2)
     st.dataframe(reach, use_container_width=True)
 
-# ==========================================================
-# FSR SCORECARD
-# ==========================================================
     st.subheader("🏆 FSR Scorecard")
-
     score = reach.copy()
-
     score = score.merge(
-        fsr_table.groupby("FSR")[
-            ["Sales_Targets"]
-        ].sum().reset_index(),
-        on="FSR",
-        how="left"
+        fsr_table.groupby("FSR")[["Sales_Targets"]].sum().reset_index(),
+        on="FSR", how="left"
     )
-
     score["Achievement %"] = np.where(
         score["Sales_Targets"] > 0,
-        score["Sales"] /
-        score["Sales_Targets"] * 100,
-        0
+        score["Sales"] / score["Sales_Targets"] * 100, 0
     )
-
     potential_total = base["outlet_code"].nunique()
+    score["Strike Rate %"] = (score["Customers Billed"] / potential_total * 100)
 
-    score["Strike Rate %"] = (
-        score["Customers Billed"] /
-        potential_total * 100
-    )
-
-    score["Sales Score"] = (
-        score["Achievement %"] /
-        score["Achievement %"].max()
-    ) * 40
-
-    score["Reach Score"] = (
-        score["Customers Billed"] /
-        score["Customers Billed"].max()
-    ) * 25
-
-    score["Strike Score"] = (
-        score["Strike Rate %"] /
-        score["Strike Rate %"].max()
-    ) * 20
-
-    score["Total Score"] = (
-        score["Sales Score"] +
-        score["Reach Score"] +
-        score["Strike Score"]
-    ).round(1)
-
-    score = score.sort_values(
-        "Total Score",
-        ascending=False
-    ).reset_index(drop=True)
+    score["Sales Score"]  = (score["Achievement %"]   / score["Achievement %"].max())   * 40
+    score["Reach Score"]  = (score["Customers Billed"] / score["Customers Billed"].max()) * 25
+    score["Strike Score"] = (score["Strike Rate %"]   / score["Strike Rate %"].max())   * 20
+    score["Total Score"]  = (score["Sales Score"] + score["Reach Score"] + score["Strike Score"]).round(1)
+    score = score.sort_values("Total Score", ascending=False).reset_index(drop=True)
 
     medals = ["🥇", "🥈", "🥉"]
-
     score["Award"] = ""
-
     for i in range(min(3, len(score))):
         score.loc[i, "Award"] = medals[i]
 
     st.dataframe(score, use_container_width=True)
 
 # ==========================================================
-# TAB 3 CUSTOMER ANALYTICS
+# TAB 3 — CUSTOMER ANALYTICS
 # ==========================================================
 with tab3:
-
     st.subheader("🅰 Repeat vs New")
-
     first_purchase = (
-        df.groupby("outlet_code")["Date"]
-        .min()
-        .reset_index()
-        .rename(columns={"Date": "First_Date"})
+        df.groupby("outlet_code")["Date"].min()
+        .reset_index().rename(columns={"Date": "First_Date"})
     )
-
-    rpt = filtered.merge(
-        first_purchase,
-        on="outlet_code",
-        how="left"
-    )
-
+    rpt = filtered.merge(first_purchase, on="outlet_code", how="left")
     rpt["Type"] = np.where(
         (rpt["First_Date"].dt.year == year_filter) &
         (rpt["First_Date"].dt.month == month_filter),
-        "New",
-        "Repeat"
+        "New", "Repeat"
     )
-
     st.dataframe(
-        rpt.groupby("Type")["outlet_code"]
-        .nunique()
-        .reset_index(),
+        rpt.groupby("Type")["outlet_code"].nunique().reset_index(),
         use_container_width=True
     )
 
     st.subheader("🚨 Lost Customers")
-
-    lost_df = previous_data[
-        previous_data["outlet_code"]
-        .isin(lost_customers)
-    ][[
-        "outlet_code",
-        "FSR",
-        "DT_Name",
-        "Brand"
-    ]].drop_duplicates()
-
-    st.dataframe(lost_df, use_container_width=True)
+    if not previous_data.empty:
+        lost_df = previous_data[
+            previous_data["outlet_code"].isin(lost_customers)
+        ][["outlet_code", "FSR", "DT_Name", "Brand"]].drop_duplicates()
+        st.dataframe(lost_df, use_container_width=True)
+    else:
+        st.info("No previous month data to compare.")
 
     st.subheader("🅲 Billing Frequency")
-
     freq = (
-        filtered.groupby("outlet_code")
-        .size()
+        filtered.groupby("outlet_code").size()
         .reset_index(name="Billing Count")
-        .sort_values(
-            "Billing Count",
-            ascending=False
-        )
+        .sort_values("Billing Count", ascending=False)
     )
-
     st.dataframe(freq, use_container_width=True)
 
 # ==========================================================
-# TAB 4 BRAND ANALYTICS
+# TAB 4 — BRAND ANALYTICS
 # ==========================================================
 with tab4:
-
     st.subheader("📦 Numeric Distribution")
-
-    num_dist = (
-        filtered.groupby("Brand")["outlet_code"]
-        .nunique()
-        .reset_index()
-    )
-
-    num_dist["Numeric Distribution %"] = (
-        num_dist["outlet_code"] /
-        cust_mtd * 100
-    ).round(1)
-
+    num_dist = filtered.groupby("Brand")["outlet_code"].nunique().reset_index()
+    num_dist["Numeric Distribution %"] = (num_dist["outlet_code"] / cust_mtd * 100).round(1) if cust_mtd > 0 else 0
     st.dataframe(num_dist, use_container_width=True)
 
     st.subheader("🏪 Weighted Distribution")
-
-    market = (
-        filtered.groupby("outlet_code")["Sales"]
-        .sum()
-        .reset_index()
-    )
-
+    market = filtered.groupby("outlet_code")["Sales"].sum().reset_index()
     total_market = market["Sales"].sum()
-
-    brand = (
-        filtered.groupby(["Brand", "outlet_code"])
-        ["Sales"].sum().reset_index()
-    )
-
-    brand = brand.merge(
-        market,
-        on="outlet_code",
-        suffixes=("_Brand", "_Outlet")
-    )
-
-    wd = (
-        brand.groupby("Brand")
-        .agg({"Sales_Outlet": "sum"})
-        .reset_index()
-    )
-
-    wd["Weighted Distribution %"] = (
-        wd["Sales_Outlet"] /
-        total_market * 100
-    ).round(1)
-
+    brand = filtered.groupby(["Brand", "outlet_code"])["Sales"].sum().reset_index()
+    brand = brand.merge(market, on="outlet_code", suffixes=("_Brand", "_Outlet"))
+    wd = brand.groupby("Brand").agg({"Sales_Outlet": "sum"}).reset_index()
+    wd["Weighted Distribution %"] = (wd["Sales_Outlet"] / total_market * 100).round(1) if total_market > 0 else 0
     st.dataframe(wd, use_container_width=True)
 
     st.subheader("🔎 Brand → SKU Sales")
-
     sku = (
-        filtered.groupby(["Brand", "SKU"])
-        .agg({"Sales": "sum"})
-        .reset_index()
-        .sort_values(
-            "Sales",
-            ascending=False
-        )
+        filtered.groupby(["Brand", "SKU"]).agg({"Sales": "sum"})
+        .reset_index().sort_values("Sales", ascending=False)
     )
-
     st.dataframe(sku, use_container_width=True)
 
 # ==========================================================
-# TAB 5 RAW DATA
+# TAB 5 — RAW DATA
 # ==========================================================
 with tab5:
-
     st.subheader("📄 Detailed Raw Data")
-
-    st.dataframe(
-        filtered,
-        use_container_width=True
-    )
+    st.dataframe(filtered, use_container_width=True)
