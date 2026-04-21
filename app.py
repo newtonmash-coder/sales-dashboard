@@ -1,7 +1,5 @@
 # ==========================================================
-# app.py
-# OPTIMISED — full dataset cached at top level so Render
-# does not reload data on every user interaction
+# app.py — Progressive loader keeps Render connection alive
 # ==========================================================
 
 import streamlit as st
@@ -12,17 +10,11 @@ from data_engine import (
     load_sales_data,
     load_targets_data,
     create_time_features,
-    merge_sales_with_targets
+    merge_sales_with_targets,
+    _get_file_list,
 )
 
-# ----------------------------------------------------------
-# PAGE CONFIG
-# ----------------------------------------------------------
-st.set_page_config(
-    page_title="Spread Masters Sales Dashboard",
-    layout="wide"
-)
-
+st.set_page_config(page_title="Spread Masters Sales Dashboard", layout="wide")
 st.title("📊 Spread Masters Sales Dashboard")
 
 # ----------------------------------------------------------
@@ -39,48 +31,100 @@ st.sidebar.caption("Current month auto-refreshes every 5 mins")
 st.sidebar.markdown("---")
 
 # ----------------------------------------------------------
-# LOAD & CACHE THE FULL MERGED DATASET
-# Decorated with cache so it only runs ONCE on startup,
-# then serves from memory for all subsequent interactions.
-# TTL=300 matches the live-file refresh interval.
+# LOAD DATA WITH LIVE PROGRESS BAR
+# The progress bar sends UI updates every file, which keeps
+# the Render websocket alive and prevents the 503 timeout.
+# Once loaded, the result is stored in session_state so
+# filter changes and tab switches never re-trigger loading.
 # ----------------------------------------------------------
-@st.cache_data(ttl=300, show_spinner="Loading data from Google Drive...")
-def load_all_data():
-    sales   = load_sales_data()
-    targets = load_targets_data()
+def build_dataset():
+    """
+    Loads all files with a visible progress bar.
+    Returns merged DataFrame or empty DataFrame on failure.
+    """
+    # Count files first so we know total steps
+    try:
+        sales_files, target_files = _get_file_list()
+    except Exception as e:
+        st.error(f"Could not connect to Google Drive: {e}")
+        return pd.DataFrame()
+
+    total_files = len(sales_files) + len(target_files)
+    if total_files == 0:
+        st.error("No files found in Google Drive folder.")
+        return pd.DataFrame()
+
+    progress_bar  = st.progress(0, text="Starting…")
+    status_text   = st.empty()
+    files_done    = [0]   # mutable counter inside closure
+
+    def on_progress(current, total, filename, kind):
+        files_done[0] += 1
+        pct  = int(files_done[0] / total_files * 100)
+        label = "sales" if kind == "sales" else "target"
+        progress_bar.progress(
+            min(pct, 100),
+            text=f"Loading {label} file {current}/{total}: {filename}"
+        )
+
+    # --- Load sales ---
+    status_text.info("📂 Loading sales files…")
+    sales, sales_errors = load_sales_data(progress_cb=on_progress)
+
+    for err in sales_errors:
+        st.warning(err)
 
     if sales.empty:
+        progress_bar.empty()
+        status_text.empty()
+        st.error("No sales data could be loaded.")
         return pd.DataFrame()
+
+    # --- Load targets ---
+    status_text.info("🎯 Loading target files…")
+    targets, target_errors = load_targets_data(progress_cb=on_progress)
+
+    for err in target_errors:
+        st.warning(err)
+
+    # --- Merge ---
+    progress_bar.progress(100, text="Combining data…")
+    status_text.info("⚙️ Building dataset…")
 
     sales = create_time_features(sales)
     df    = merge_sales_with_targets(sales, targets)
+
+    progress_bar.empty()
+    status_text.empty()
+
     return df
 
 
-df = load_all_data()
+# Use session_state so data survives tab/filter interactions
+# without re-downloading. Clear with the Refresh button above.
+if "df" not in st.session_state or st.session_state.get("df") is None:
+    df = build_dataset()
+    if df.empty:
+        st.stop()
+    st.session_state["df"] = df
+else:
+    df = st.session_state["df"]
 
-if df.empty:
-    st.error("No data could be loaded. Check your Google Drive folder ID and file names.")
-    st.stop()
-
-st.success(f"✅ {len(df):,} rows loaded from {df['SourceFile'].nunique()} file(s)")
-
-# ----------------------------------------------------------
-# CLEAN DATE
-# ----------------------------------------------------------
-df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-df = df.sort_values("Date")
+st.success(f"✅ {len(df):,} rows from {df['SourceFile'].nunique()} file(s)")
 
 # ----------------------------------------------------------
 # COLUMN GUARD
 # ----------------------------------------------------------
+df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+df = df.sort_values("Date")
+
 required_cols = ["Year", "Month", "DT_Name", "Brand", "FSR",
                  "Sales", "Sales_Targets", "outlet_code"]
 missing_cols  = [c for c in required_cols if c not in df.columns]
 
 if missing_cols:
     st.error(f"Missing columns: {missing_cols}")
-    st.info(f"Columns in your data: {list(df.columns)}")
+    st.info(f"Columns found: {list(df.columns)}")
     st.stop()
 
 # ----------------------------------------------------------
@@ -92,29 +136,25 @@ year_filter = st.sidebar.selectbox(
     "Select Year",
     sorted(df["Year"].dropna().unique(), reverse=True)
 )
-
 month_filter = st.sidebar.selectbox(
     "Select Month",
     sorted(df["Month"].dropna().unique())
 )
-
 dt_filter = st.sidebar.multiselect(
     "Select DT_Name",
     sorted(df["DT_Name"].dropna().unique())
 )
-
 brand_filter = st.sidebar.multiselect(
     "Select Brand",
     sorted(df["Brand"].dropna().unique())
 )
-
 fsr_filter = st.sidebar.multiselect(
     "Select FSR",
     sorted(df["FSR"].dropna().unique())
 )
 
 # ----------------------------------------------------------
-# BASE FILTER
+# FILTERING
 # ----------------------------------------------------------
 base = df.copy()
 if dt_filter:    base = base[base["DT_Name"].isin(dt_filter)]
@@ -126,55 +166,38 @@ filtered = base[
     (base["Month"] == month_filter)
 ].copy()
 
-# ----------------------------------------------------------
-# QTD / YTD
-# ----------------------------------------------------------
 selected_quarter = filtered["Quarter"].max() if not filtered.empty else 1
 qtd_data = base[(base["Year"] == year_filter) & (base["Quarter"] == selected_quarter)].copy()
 ytd_data = base[base["Year"] == year_filter].copy()
 
-# ----------------------------------------------------------
-# PREVIOUS MONTH
-# ----------------------------------------------------------
 prev_month = month_filter - 1
 prev_year  = year_filter
 if prev_month == 0:
     prev_month = 12
     prev_year -= 1
 
-previous_data = base[
-    (base["Year"]  == prev_year) &
-    (base["Month"] == prev_month)
-].copy()
-
-# ----------------------------------------------------------
-# CUSTOMER SETS
-# ----------------------------------------------------------
+previous_data  = base[(base["Year"] == prev_year) & (base["Month"] == prev_month)].copy()
 prev_customers = set(previous_data["outlet_code"].dropna().unique())
 curr_customers = set(filtered["outlet_code"].dropna().unique())
 lost_customers = prev_customers - curr_customers
 new_customers  = curr_customers - prev_customers
 
 # ----------------------------------------------------------
-# KPI VALUES
+# KPIs
 # ----------------------------------------------------------
 total_sales  = filtered["Sales"].sum()
 total_target = filtered["Sales_Targets"].sum()
 achievement  = (total_sales / total_target * 100) if total_target > 0 else 0
-
-cust_mtd = filtered["outlet_code"].nunique()
-cust_qtd = qtd_data["outlet_code"].nunique()
-cust_ytd = ytd_data["outlet_code"].nunique()
+cust_mtd     = filtered["outlet_code"].nunique()
+cust_qtd     = qtd_data["outlet_code"].nunique()
+cust_ytd     = ytd_data["outlet_code"].nunique()
 
 # ----------------------------------------------------------
 # TABS
 # ----------------------------------------------------------
 tab1, tab2, tab3, tab4, tab5 = st.tabs([
-    "Executive Summary",
-    "FSR Performance",
-    "Customer Analytics",
-    "Brand Analytics",
-    "Raw Data"
+    "Executive Summary", "FSR Performance",
+    "Customer Analytics", "Brand Analytics", "Raw Data"
 ])
 
 # ==========================================================
@@ -182,7 +205,6 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs([
 # ==========================================================
 with tab1:
     st.subheader("📌 Executive KPIs")
-
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Sales",         f"{total_sales:,.0f}")
     c2.metric("Targets",       f"{total_target:,.0f}")
@@ -199,7 +221,6 @@ with tab1:
 # ==========================================================
 with tab2:
     st.subheader("📌 FSR Performance")
-
     fsr_table = (
         filtered.groupby(["FSR", "Brand"])
         .agg({"Sales": "sum", "Sales_Targets": "sum"})
@@ -207,8 +228,7 @@ with tab2:
     )
     fsr_table["Achievement %"] = np.where(
         fsr_table["Sales_Targets"] > 0,
-        (fsr_table["Sales"] / fsr_table["Sales_Targets"] * 100).round(1),
-        0
+        (fsr_table["Sales"] / fsr_table["Sales_Targets"] * 100).round(1), 0
     )
     st.dataframe(fsr_table, use_container_width=True)
 
@@ -232,20 +252,17 @@ with tab2:
         score["Sales_Targets"] > 0,
         score["Sales"] / score["Sales_Targets"] * 100, 0
     )
-    potential_total = base["outlet_code"].nunique()
-    score["Strike Rate %"] = (score["Customers Billed"] / potential_total * 100)
-
-    score["Sales Score"]  = (score["Achievement %"]    / score["Achievement %"].max())    * 40
-    score["Reach Score"]  = (score["Customers Billed"] / score["Customers Billed"].max()) * 25
-    score["Strike Score"] = (score["Strike Rate %"]    / score["Strike Rate %"].max())    * 20
-    score["Total Score"]  = (score["Sales Score"] + score["Reach Score"] + score["Strike Score"]).round(1)
+    potential_total       = base["outlet_code"].nunique()
+    score["Strike Rate %"] = score["Customers Billed"] / potential_total * 100
+    score["Sales Score"]   = (score["Achievement %"]    / score["Achievement %"].max())    * 40
+    score["Reach Score"]   = (score["Customers Billed"] / score["Customers Billed"].max()) * 25
+    score["Strike Score"]  = (score["Strike Rate %"]    / score["Strike Rate %"].max())    * 20
+    score["Total Score"]   = (score["Sales Score"] + score["Reach Score"] + score["Strike Score"]).round(1)
     score = score.sort_values("Total Score", ascending=False).reset_index(drop=True)
-
-    medals = ["🥇", "🥈", "🥉"]
     score["Award"] = ""
-    for i in range(min(3, len(score))):
-        score.loc[i, "Award"] = medals[i]
-
+    for i, medal in enumerate(["🥇", "🥈", "🥉"]):
+        if i < len(score):
+            score.loc[i, "Award"] = medal
     st.dataframe(score, use_container_width=True)
 
 # ==========================================================
@@ -275,7 +292,7 @@ with tab3:
         ][["outlet_code", "FSR", "DT_Name", "Brand"]].drop_duplicates()
         st.dataframe(lost_df, use_container_width=True)
     else:
-        st.info("No previous month data available to compare.")
+        st.info("No previous month data to compare.")
 
     st.subheader("🅲 Billing Frequency")
     freq = (
@@ -292,8 +309,7 @@ with tab4:
     st.subheader("📦 Numeric Distribution")
     num_dist = filtered.groupby("Brand")["outlet_code"].nunique().reset_index()
     num_dist["Numeric Distribution %"] = (
-        (num_dist["outlet_code"] / cust_mtd * 100).round(1)
-        if cust_mtd > 0 else 0
+        (num_dist["outlet_code"] / cust_mtd * 100).round(1) if cust_mtd > 0 else 0
     )
     st.dataframe(num_dist, use_container_width=True)
 
@@ -304,8 +320,7 @@ with tab4:
     brand_df     = brand_df.merge(market, on="outlet_code", suffixes=("_Brand", "_Outlet"))
     wd           = brand_df.groupby("Brand").agg({"Sales_Outlet": "sum"}).reset_index()
     wd["Weighted Distribution %"] = (
-        (wd["Sales_Outlet"] / total_market * 100).round(1)
-        if total_market > 0 else 0
+        (wd["Sales_Outlet"] / total_market * 100).round(1) if total_market > 0 else 0
     )
     st.dataframe(wd, use_container_width=True)
 
