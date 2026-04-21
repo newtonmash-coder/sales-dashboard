@@ -1,7 +1,11 @@
 # ==========================================================
 # drive_loader.py
-# FINAL PROFESSIONAL VERSION
+# FINAL PROFESSIONAL VERSION (RENDER ENV READY)
+# Keeps ALL original features + fixes auth method
 # ==========================================================
+
+import os
+import json
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -14,12 +18,17 @@ import streamlit as st
 
 # ----------------------------------------------------------
 # GOOGLE DRIVE AUTH
+# Reads GOOGLE_CREDS from Render Environment Variable
 # ----------------------------------------------------------
 @st.cache_resource
 def get_drive_service():
 
-    creds = service_account.Credentials.from_service_account_file(
-        "service_account_key.json",
+    creds_json = os.environ["GOOGLE_CREDS"]
+
+    creds_dict = json.loads(creds_json)
+
+    creds = service_account.Credentials.from_service_account_info(
+        creds_dict,
         scopes=[
             "https://www.googleapis.com/auth/drive.readonly"
         ]
