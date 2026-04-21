@@ -121,19 +121,29 @@ def read_drive_file(file_id):
     buf, filename, is_sheet = download_file_bytes(file_id)
     name_lower = filename.lower()
 
-    # Google Sheets exported as CSV
+    # Google Sheets exported as CSV — try multiple encodings
     if is_sheet:
-        try:
-            return pd.read_csv(buf)
-        except Exception as e:
-            raise ValueError(f"Google Sheet '{filename}' could not be read as CSV: {e}")
+        for encoding in ["utf-8", "latin-1", "windows-1252", "utf-8-sig"]:
+            try:
+                buf.seek(0)
+                return pd.read_csv(buf, encoding=encoding)
+            except UnicodeDecodeError:
+                continue
+            except Exception as e:
+                raise ValueError(f"Google Sheet '{filename}' could not be read: {e}")
+        raise ValueError(f"Google Sheet '{filename}' could not be decoded with any known encoding.")
 
-    # Real .csv file
+    # Real .csv file — try multiple encodings (Windows Excel saves as latin-1)
     if name_lower.endswith(".csv"):
-        try:
-            return pd.read_csv(buf)
-        except Exception as e:
-            raise ValueError(f"CSV '{filename}' could not be read: {e}")
+        for encoding in ["utf-8", "latin-1", "windows-1252", "utf-8-sig"]:
+            try:
+                buf.seek(0)
+                return pd.read_csv(buf, encoding=encoding)
+            except UnicodeDecodeError:
+                continue
+            except Exception as e:
+                raise ValueError(f"CSV '{filename}' could not be read: {e}")
+        raise ValueError(f"CSV '{filename}' could not be decoded with any known encoding.")
 
     # Real Excel file
     if name_lower.endswith(".xlsx") or name_lower.endswith(".xls"):
@@ -146,15 +156,20 @@ def read_drive_file(file_id):
             except Exception as e:
                 raise ValueError(f"'{filename}' could not be read as Excel or CSV: {e}")
 
-    # Unknown extension — try CSV then Excel
-    try:
-        return pd.read_csv(buf)
-    except Exception:
-        buf.seek(0)
+    # Unknown extension — try CSV with multiple encodings, then Excel
+    for encoding in ["utf-8", "latin-1", "windows-1252", "utf-8-sig"]:
         try:
-            return pd.read_excel(buf, engine="openpyxl")
-        except Exception as e:
-            raise ValueError(f"Cannot read '{filename}': {e}")
+            buf.seek(0)
+            return pd.read_csv(buf, encoding=encoding)
+        except UnicodeDecodeError:
+            continue
+        except Exception:
+            break
+    buf.seek(0)
+    try:
+        return pd.read_excel(buf, engine="openpyxl")
+    except Exception as e:
+        raise ValueError(f"Cannot read '{filename}': {e}")
 
 
 # ----------------------------------------------------------
