@@ -1,16 +1,18 @@
 # ==========================================================
-# app.py — Reads from local disk cache written by preload.py
-# Loads instantly. No Google Drive calls at page load.
+# app.py
+# Smart loader: reads /tmp disk cache if available (fast),
+# downloads from Drive with live progress if not (first load).
+# Progress updates keep WebSocket alive during download.
 # ==========================================================
 
-import os
 import streamlit as st
 import pandas as pd
 import numpy as np
 
 from data_engine import (
-    load_sales_data,
-    load_targets_data,
+    disk_cache_exists,
+    build_and_cache,
+    read_from_disk,
     create_time_features,
     merge_sales_with_targets,
 )
@@ -25,41 +27,58 @@ st.sidebar.title("Spread Masters")
 st.sidebar.markdown("---")
 
 if st.sidebar.button("🔄 Refresh Data Now"):
-    # Clears disk cache + triggers Render redeploy is not possible
-    # so this just clears Streamlit's in-memory cache to re-read disk
-    st.cache_data.clear()
+    # Remove disk cache so next load re-downloads from Drive
+    import os
+    for f in ["data_cache/sales.parquet", "data_cache/targets.parquet",
+              "/tmp/data_cache/sales.parquet", "/tmp/data_cache/targets.parquet"]:
+        try: os.remove(f)
+        except: pass
     st.session_state.pop("df", None)
+    st.cache_data.clear()
     st.rerun()
 
-st.sidebar.caption("Data refreshes on server restart")
+st.sidebar.caption("Current month auto-refreshes on restart")
 st.sidebar.markdown("---")
 
 # ----------------------------------------------------------
-# LOAD FROM DISK (instant — no Drive calls)
+# SMART LOAD
+# On first visit (no disk cache): download from Drive with
+#   a live progress bar — keeps WebSocket alive.
+# On subsequent visits (disk cache exists): read in <1 sec.
+# On filter/tab change (session_state has df): instant.
 # ----------------------------------------------------------
-DATA_DIR = "data_cache"
-
-if not os.path.exists(DATA_DIR) or not os.path.exists(os.path.join(DATA_DIR, "sales.parquet")):
-    st.error(
-        "⚠️ Data files not found on disk. "
-        "This usually means the server just restarted and preload.py hasn't finished yet. "
-        "Please wait 60 seconds and refresh the page."
-    )
-    st.info("If this persists, check your Render logs for PRELOAD errors.")
-    st.stop()
-
 if "df" not in st.session_state:
-    with st.spinner("Reading data..."):
-        sales   = load_sales_data()
-        targets = load_targets_data()
 
-        if sales.empty:
-            st.error("No sales data found.")
-            st.stop()
+    if disk_cache_exists():
+        # Fast path — read from /tmp disk cache
+        with st.spinner("Reading data from disk..."):
+            sales_df, targets_df = read_from_disk()
+    else:
+        # Slow path — download from Drive with progress bar
+        st.info("📡 First load — downloading data from Google Drive. This takes about 60 seconds...")
+        status_ph    = st.empty()
+        progress_bar = st.progress(0, text="Connecting to Google Drive...")
 
-        sales = create_time_features(sales)
-        df    = merge_sales_with_targets(sales, targets)
-        st.session_state["df"] = df
+        sales_df, targets_df = build_and_cache(status_ph, progress_bar)
+
+        progress_bar.progress(100, text="Done!")
+        status_ph.empty()
+        progress_bar.empty()
+
+    if sales_df.empty:
+        st.error(
+            "No sales data could be loaded. "
+            "Check that your Google Drive folder ID is correct and files are named "
+            "like '1 sales 2024.csv'."
+        )
+        st.stop()
+
+    with st.spinner("Building dashboard..."):
+        sales_df = create_time_features(sales_df)
+        df       = merge_sales_with_targets(sales_df, targets_df)
+
+    st.session_state["df"] = df
+
 else:
     df = st.session_state["df"]
 
@@ -74,8 +93,8 @@ required_cols = ["Year", "Month", "DT_Name", "Brand", "FSR",
 missing_cols  = [c for c in required_cols if c not in df.columns]
 
 if missing_cols:
-    st.error(f"Missing columns: {missing_cols}")
-    st.info(f"Columns in data: {list(df.columns)}")
+    st.error(f"Missing columns in your data: {missing_cols}")
+    st.info(f"Columns found: {list(df.columns)}")
     st.stop()
 
 st.success(f"✅ {len(df):,} rows from {df['SourceFile'].nunique()} file(s)")
@@ -111,7 +130,7 @@ if prev_month == 0:
     prev_month = 12
     prev_year -= 1
 
-previous_data  = base[(base["Year"] == prev_year) & (base["Month"] == prev_month)].copy()
+previous_data  = base[(base["Year"] == prev_year)  & (base["Month"] == prev_month)].copy()
 prev_customers = set(previous_data["outlet_code"].dropna().unique())
 curr_customers = set(filtered["outlet_code"].dropna().unique())
 lost_customers = prev_customers - curr_customers
@@ -182,8 +201,11 @@ with tab2:
         fsr_table.groupby("FSR")[["Sales_Targets"]].sum().reset_index(),
         on="FSR", how="left"
     )
-    score["Achievement %"]  = np.where(score["Sales_Targets"] > 0, score["Sales"] / score["Sales_Targets"] * 100, 0)
-    potential_total          = base["outlet_code"].nunique()
+    score["Achievement %"]  = np.where(
+        score["Sales_Targets"] > 0,
+        score["Sales"] / score["Sales_Targets"] * 100, 0
+    )
+    potential_total         = base["outlet_code"].nunique()
     score["Strike Rate %"]  = score["Customers Billed"] / potential_total * 100
     score["Sales Score"]    = (score["Achievement %"]    / score["Achievement %"].max())    * 40
     score["Reach Score"]    = (score["Customers Billed"] / score["Customers Billed"].max()) * 25
@@ -206,7 +228,8 @@ with tab3:
     )
     rpt = filtered.merge(first_purchase, on="outlet_code", how="left")
     rpt["Type"] = np.where(
-        (rpt["First_Date"].dt.year == year_filter) & (rpt["First_Date"].dt.month == month_filter),
+        (rpt["First_Date"].dt.year  == year_filter) &
+        (rpt["First_Date"].dt.month == month_filter),
         "New", "Repeat"
     )
     st.dataframe(rpt.groupby("Type")["outlet_code"].nunique().reset_index(), use_container_width=True)
