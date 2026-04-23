@@ -13,8 +13,8 @@ from io import BytesIO
 from datetime import datetime
 
 DATA_DIR     = "/tmp/data_cache"   # /tmp persists within a session on Render
-SALES_FILE   = os.path.join(DATA_DIR, "sales.parquet")
-TARGETS_FILE = os.path.join(DATA_DIR, "targets.parquet")
+SALES_FILE   = os.path.join(DATA_DIR, "sales.csv")
+TARGETS_FILE = os.path.join(DATA_DIR, "targets.csv")
 
 FOLDER_ID    = "1tX9kPXQK3WQvQVAIF0YambVHJyh34qeL"
 
@@ -139,7 +139,7 @@ def _get_file_list():
 # ----------------------------------------------------------
 def build_and_cache(status_placeholder, progress_bar):
     """
-    Downloads all files from Drive, saves parquet to /tmp.
+    Downloads all files from Drive, saves CSV to /tmp.
     Returns (sales_df, targets_df).
     Uses status/progress placeholders to keep UI alive.
     """
@@ -201,11 +201,21 @@ def build_and_cache(status_placeholder, progress_bar):
     sales_df   = pd.concat(sales_frames,   ignore_index=True) if sales_frames   else pd.DataFrame()
     targets_df = pd.concat(targets_frames, ignore_index=True) if targets_frames else pd.DataFrame()
 
-    # Save to /tmp so subsequent page interactions read from disk
+    # Sanitise mixed-type columns before saving
+    def _sanitise(df):
+        for col in df.columns:
+            if df[col].dtype == object:
+                df[col] = df[col].astype(str)
+        return df
+
+    sales_df   = _sanitise(sales_df)
+    targets_df = _sanitise(targets_df)
+
+    # Save to /tmp — CSV avoids pyarrow type errors with mixed columns
     if not sales_df.empty:
-        sales_df.to_parquet(SALES_FILE, index=False)
+        sales_df.to_csv(SALES_FILE, index=False)
     if not targets_df.empty:
-        targets_df.to_parquet(TARGETS_FILE, index=False)
+        targets_df.to_csv(TARGETS_FILE, index=False)
 
     return sales_df, targets_df
 
@@ -214,8 +224,8 @@ def build_and_cache(status_placeholder, progress_bar):
 # READ FROM DISK (fast — used after first load)
 # ----------------------------------------------------------
 def read_from_disk():
-    sales_df   = pd.read_parquet(SALES_FILE)   if os.path.exists(SALES_FILE)   else pd.DataFrame()
-    targets_df = pd.read_parquet(TARGETS_FILE) if os.path.exists(TARGETS_FILE) else pd.DataFrame()
+    sales_df   = pd.read_csv(SALES_FILE)   if os.path.exists(SALES_FILE)   else pd.DataFrame()
+    targets_df = pd.read_csv(TARGETS_FILE) if os.path.exists(TARGETS_FILE) else pd.DataFrame()
     return sales_df, targets_df
 
 

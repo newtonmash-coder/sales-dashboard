@@ -29,8 +29,8 @@ st.sidebar.markdown("---")
 if st.sidebar.button("🔄 Refresh Data Now"):
     # Remove disk cache so next load re-downloads from Drive
     import os
-    for f in ["data_cache/sales.parquet", "data_cache/targets.parquet",
-              "/tmp/data_cache/sales.parquet", "/tmp/data_cache/targets.parquet"]:
+    for f in ["data_cache/sales.csv", "data_cache/targets.csv",
+              "/tmp/data_cache/sales.csv", "/tmp/data_cache/targets.csv"]:
         try: os.remove(f)
         except: pass
     st.session_state.pop("df", None)
