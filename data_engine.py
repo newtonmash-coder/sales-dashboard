@@ -239,6 +239,12 @@ def disk_cache_exists():
 def create_time_features(df):
     if df.empty:
         return df
+    # Coerce numeric columns that may have become strings after CSV round-trip
+    df["Sales"] = pd.to_numeric(df["Sales"], errors="coerce").fillna(0)
+    for col in ["Month_File", "Year_File"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
     df["Date"]    = pd.to_datetime(df["Date"], errors="coerce")
     df["Year"]    = df["Date"].dt.year
     df["Month"]   = df["Date"].dt.month
@@ -263,9 +269,17 @@ def merge_sales_with_targets(sales, targets):
     merge_keys = [k for k in possible_keys
                   if k in sales.columns and k in targets.columns]
 
+    # Force all merge key columns to str in BOTH dataframes so pandas
+    # never hits a str-vs-int64 type mismatch error during merge
+    for key in merge_keys:
+        sales[key]   = sales[key].astype(str).str.strip()
+        targets[key] = targets[key].astype(str).str.strip()
+
     merged = sales.merge(targets, on=merge_keys, how="left", suffixes=("", "_target"))
     if "Sales_Targets" in merged.columns:
-        merged["Sales_Targets"] = merged["Sales_Targets"].fillna(0)
+        merged["Sales_Targets"] = pd.to_numeric(
+            merged["Sales_Targets"], errors="coerce"
+        ).fillna(0)
     else:
         merged["Sales_Targets"] = 0
     return merged
